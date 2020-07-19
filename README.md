@@ -1,6 +1,8 @@
 # 🏠 Predicting Airbnb Listing Prices with Machine and Deep Learning 🏠
 
-Airbnb is a popular online marketplace company focused on offering lodging, accommodations, and tourism experiences for travelers around the world. In this final project, I aimed predict Airbnb listing prices in the city of Chicago using a variety of machine learning methodologies including random forest regression, XGBoost, as well as a neural network. Overall, random forest regression was the best performing model with a average test error of 0.2393. With this in mind, I showed that a more complex deep learning model is not necessary in the case of this regression prediction problem. 
+Airbnb is a popular online marketplace company focused on offering lodging, accommodations, and tourism experiences for travelers around the world. In this final project, I aimed predict Airbnb listing prices in the city of Chicago using a variety of machine learning methodologies including random forest regression, XGBoost, as well as a neural network. 
+
+Overall, random forest regression was the best performing model with a average test error of 0.2393. With this in mind, I showed that a more complex deep learning model is not necessary in the case of this regression prediction problem. 
 
 Through random forest regression and XGBost it was determined that the top five most important features were the following: 
 
