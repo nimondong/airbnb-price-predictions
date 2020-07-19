@@ -1,0 +1,608 @@
+---
+title: |
+  ![](images/logo2.png){width=4in}  
+  
+  Predicting Airbnb Prices with Machine Learning and Deep Learning
+author: | 
+  Nimon Dong  
+  
+  STAT 301-3 Data Science III Final Project
+date: "6/12/2020"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    highlight: "tango"
+editor_options: 
+  chunk_output_type: console
+---
+
+***
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE}
+# Loading Packages --------------------------------------------------------
+library(tidyverse)
+library(readr)
+library(janitor)
+library(corrplot)
+library(cowplot)
+library(ggmap)
+
+# modeling
+library(modelr)
+library(ranger)
+library(vip)
+library(pdp)
+library(xgboost)
+library(rsample)
+library(janitor)
+library(keras)
+library(tensorflow)
+
+# visuals
+library(knitr)
+library(kableExtra)
+library(DT)
+library(png)
+library(grid)
+library(data.table)
+library(ggpubr)
+
+select <- dplyr::select
+
+# Set Seed ----------------------------------------------------------------
+set.seed(10221998)
+
+# Loading Data ------------------------------------------------------------
+airbnb_data <- read_csv("data/processed/cleaned_airbnb_data.csv") %>% clean_names()
+
+airbnb_data <- airbnb_data %>% 
+  as_tibble()
+
+model_data <- read_csv("data/processed/model_data.csv") %>%
+  select(-latitude,
+         -longitude,
+         -review_scores_rating) %>%
+  clean_names()
+
+model_data_split <- model_data %>%
+  crossv_kfold(5, id = "fold") %>%
+  mutate(train = map(train, as_tibble),
+         test = map(test, as_tibble))
+
+# Helper Functions --------------------------------------------------------
+mse_ranger <- function(model, test, outcome) {
+  if(!is_tibble(test)){
+    test <- test %>% as_tibble()
+  }
+  preds <- predict(model, test)$predictions
+  mse <- mean((test[[outcome]] - preds)^2)
+  return(mse)
+}
+
+xgb_matrix <- function(dat, outcome, exclude_vars){
+  dat_types <- dat %>% map_chr(class)
+  outcome_type <- class(dat[[outcome]])
+  
+  if("chr" %in% dat_types){
+    print("You must encode characters as factors.")
+    return(NULL)
+    
+  } else {
+    if(outcome_type == "factor" & nlevels(dat[[outcome]]) == 2){
+      tmp <- dat %>% select(outcome) %>% onehot::onehot() %>% predict(dat)  
+      lab <- tmp[,1]
+    } else {
+      lab <- dat[[outcome]]
+    }
+    
+    mat <- dat %>% dplyr::select(-outcome, -all_of(exclude_vars)) %>%
+      onehot::onehot() %>%
+      predict(dat)
+    
+    return(xgb.DMatrix(data = mat, 
+                       label = lab))
+  }
+  
+}
+
+xg_error <- function(model, test_mat, metric = "mse"){
+  preds = predict(model, test_mat)
+  vals = getinfo(test_mat, "label")
+  
+  if(metric == "mse"){
+    err <- mean((preds - vals)^2)
+    
+  } else if(metric == "misclass") {
+    err <- mean(preds != vals)
+  }
+  
+  return(err)
+}
+```
+
+## Executive Summary
+Airbnb is a popular online marketplace company focused on offering lodging, accommodations, and tourism experiences for travelers around the world. In this final project, I aimed predict Airbnb listing prices in the city of Chicago using a variety of machine learning methodologies including random forest regression, XGBoost, as well as a neural network. Overall, random forest regression was the best performing model with a average test error of 0.2393. With this in mind, I showed that a more complex deep learning model is not necessary in the case of this regression prediction problem. 
+
+Through random forest regression and XGBost it was determined that the top five most important features were the following: 
+
+1. The number of people the property accommodates 
+2. Room type (e.g. whole house or private room)
+3. Cleaning fees
+4. Walk score
+5. The price per additional guest above the guests
+
+Overall, for practical applications, these models can give a host an optimal price they should charge for their new listing. On the consumer side, this will help travelers determine whether or not the listing price they see is "worth it". 
+
+***
+
+## Model Fitting
+
+For this final project, I explore a variety of machine learning methodologies including bagging, random forest, XGBoost, and neural networks. For each model, I used k-fold cross validation (5 folds) as my primary resampling method. Given I am dealing with a regression prediction problem, the model performance evaluation metric is mean squared error (MSE).
+
+The data for my final project was sourced from Insideairbnb.com, a site that scrapes Airbnb listing data from multiple cities around the world. From this website, I downloaded and combined detailed Airbnb listing information for Chicago, Illinois as of April 2020. Originally, the plan was to combine data across 10 major US cities. However, due to computational restraints, I decided to scale down the project to only one city. Nevertheless, this Chicago dataset can still be used as a proof of concept. 
+
+Overall, my final cleaned dataset had 39 predictors with 8,183 observations. The codebook is available in the appendix for predictor explanations. 
+
+### Bagging and Random Forests
+
+First, I built bagging and random forest models, tuning the `mtry` parameter. Below is a plot of training, test, and OOB error versus `mtry`. At a first glance, it seems like a `mtry` between 7 to 10 works pretty well, with any `mtry` above 10 showing diminishing returns in test error. 
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+model_rf_reg <- model_data_split %>% 
+  crossing(mtry = 1:(ncol(model_data) - 2)) %>%
+  mutate(model = map2(.x = train, .y = mtry, 
+                      .f = function(x, y) ranger(price ~ . - id,
+                                                 mtry = y, 
+                                                 data = x, 
+                                                 splitrule = "variance",
+                                                 importance = "impurity")),
+         train_err = map2(model, train, mse_ranger, outcome = "price"),
+         test_err = map2(model, test, mse_ranger, outcome = "price"), 
+         oob_err = map(.x = model, 
+                       .f = function(x) x[["prediction.error"]]))
+
+model_rf_best <- model_rf_reg %>%
+  unnest(oob_err) %>%
+  unnest(train_err) %>%
+  unnest(test_err) %>%
+  group_by(mtry) %>%
+  summarize(oob_error = mean(oob_err),
+            train_error = mean(train_err),
+            test_error = mean(test_err)) %>%
+  arrange(test_error) %>%
+  mutate_if(is.numeric, round, digits = 4)
+```
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis', fig.align='center'}
+model_rf_best %>%  
+  ggplot() +
+  geom_line(aes(mtry, oob_error, color = "OOB Error")) +
+  geom_line(aes(mtry, train_error, color = "Training Error")) +
+  geom_line(aes(mtry, test_error, color = "Test Error")) + 
+  labs(x = "mtry", y = "MSE") + 
+  scale_color_manual("", values = c("purple", "red", "blue")) + 
+  theme_bw()
+```
+
+Here are the results of my bagging and random forest models ordered by test error. It looks like the best performing model was a random forest model with a `mtry` of 8. This model has an overall average test_error across folds of *0.2393*. Not bad for a starting point.  
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis', fig.align='center'}
+datatable(model_rf_best, rownames = FALSE, filter="top", options = list(pageLength = 5, scrollX=T))
+```
+
+Below are the top 10 most important features selected by my best performing random forest model.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis', fig.align='center'}
+model_rf_variable <- ranger(price ~ . - id,
+                            data = model_data,
+                            mtry = 8,
+                            importance = "impurity",
+                            splitrule = "variance")
+vip(model_rf_variable) 
+```
+
+The most important feature the random forest model selected in predicting Airbnb listing prices are quite intuitive. Given the main options one is considering when browsing the Airbnb site for a booking, it is not surprising that the number of people the listing accommodates for, location, and reviews are in the top ten. 
+
+***
+
+### XGBoost
+
+Next, I built a XGBoost machine learning model, tuning the `learn_rate` parameter. XGBoost is quite a popular method used by many people (especially in Kaggle competitions) given it superior model performance across different applications. Below is a plot of training, test, error versus `learning_rate`. Again, at a first glance, it seems like a `learning_rate` below the 0.05 threshold works pretty well, with any `learning_rate` above  0.10 showing diminishing returns in test error. 
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+model_xg_reg <- model_data_split %>%
+  crossing(learn_rate = 10^seq(-10, -.1, length.out = 20)) %>%
+  mutate(train_mat = map(train, xgb_matrix, outcome = "price", exclude_vars = "id"),
+         test_mat = map(test, xgb_matrix, outcome = "price", exclude_vars = "id"),
+         xg_model = map2(.x = train_mat, .y = learn_rate, 
+                         .f = function(x, y) xgb.train(params = list(eta = y,
+                                                                     depth = 10,
+                                                                     objective = "reg:squarederror"), 
+                                                       data = x, 
+                                                       nrounds = 500,
+                                                       silent = TRUE)), 
+         xg_train_mse = map2(xg_model, train_mat, xg_error, metric = "mse"),
+         xg_test_mse = map2(xg_model, test_mat, xg_error, metric = "mse"))
+
+model_xg_best <- model_xg_reg %>%
+  unnest(xg_train_mse) %>%
+  unnest(xg_test_mse) %>%
+  group_by(learn_rate) %>%
+  summarize(train_error = mean(xg_train_mse),
+            test_error = mean(xg_test_mse)) %>%
+  arrange(test_error) %>%
+  mutate_if(is.numeric, round, digits = 4)
+```
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis', fig.align='center'}
+model_xg_best %>%  
+  ggplot() +
+  geom_line(aes(learn_rate, train_error, color = "Training Error")) +
+  geom_line(aes(learn_rate, test_error, color = "Test Error")) + 
+  labs(x = "Learning Rate", y = "MSE") + 
+  scale_color_manual("", values = c("red", "blue")) + 
+  theme_bw()
+```
+
+Here are the results of my tuned XGBoost models ordered by test error. It looks like the best performing model was one with a `learning_rate` of 0.0217. This model has an overall average test_error across folds of *0.2575*. 
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis', fig.align='center'}
+datatable(model_xg_best, rownames = FALSE, filter="top", options = list(pageLength = 5, scrollX=T))
+```
+
+Below are the top 10 most important features selected by my best performing XGBoost model.
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis', fig.align='center'}
+xg_reg_mod <- model_xg_reg %>% 
+  arrange(unlist(xg_test_mse)) %>%
+  pluck("xg_model", 1)
+
+vip(xg_reg_mod)
+```
+
+The XGBoost model picked many of the same features my random forest model selected. However, the XGBoost model places heavy weight on room type (e.g. entire home or private room). Interestingly, the XGBoost determined that on-site parking is more important amenitiy. 
+
+***
+
+### Neural Network
+
+Finally, I ran neural networks to see if I could improve upon my Random Forest and XGBoost models. After experimenting with different parameters, my best performing neural network had four hidden layers, using relu activation functions and L1 regularization. Below is a summary of my model. 
+
+``` {r, message = FALSE, warning = FALSE, echo = FALSE, results='asis'}
+model_train <- model_data %>% select(-id) %>% sample_frac(0.08) 
+
+model_test <- model_data %>% select(-id) %>% setdiff(model_train)
+
+
+model_train_ohe <- model_train %>%
+  select(-price)
+
+model_test_ohe <- model_test %>%
+  select(-price)
+
+# standardizing data
+means_train_dat <- apply(model_train_ohe, 2, mean)
+sd_train_dat <- apply(model_test_ohe, 2, sd)
+
+train_data <- scale(model_train_ohe, 
+                    center = means_train_dat, 
+                    scale = sd_train_dat)
+
+test_data <- scale(model_test_ohe, 
+                   center = means_train_dat, 
+                   scale = sd_train_dat)
+
+# Modeling
+
+# creating targets
+train_targets <- model_train %>%
+  pull(price)
+
+test_targets <- model_test %>%
+  pull(price)
+
+build_model <- function() {
+  model <- keras_model_sequential() %>% 
+    layer_dense(units = 128, 
+                activation = "relu",
+                kernel_regularizer = regularizer_l1(0.01),
+                input_shape = dim(train_data)[[2]]) %>% 
+    layer_dense(units = 256, 
+                activation = "relu",
+                kernel_regularizer = regularizer_l1(0.01)) %>% 
+    layer_dense(units = 256, 
+                activation = "relu",
+                kernel_regularizer = regularizer_l1(0.01)) %>% 
+    layer_dense(units = 512, 
+                activation = "relu",
+                kernel_regularizer = regularizer_l1(0.01)) %>% 
+    layer_dense(units = 1) 
+  
+  model %>% compile(
+    optimizer = "rmsprop", 
+    loss = "mse", 
+    metrics = c("mse")
+  )
+}
+
+model <- build_model()
+```
+
+``` {r, echo=FALSE}
+summary(model)
+```
+
+However, despite testing and running several different iterations of my neural networks, this model architecture did not perform as well as my Random Forest and XGBoost models. My best neural network only resulted in a test error of *0.2858*. 
+
+*** 
+
+## Conclusion
+
+Overall, the random forest model performed the best with a test mean squared error of *0.2393*. In this case, the simplest machine learning model performed the best. Given the regression prediction problem at hand, a more advanced deep learning neural network models are simply not necessary.
+
+### Future Work
+
+Clearly there is still room for improvements in my models. For example, natural language processing (NPL) would be a interesting future development. Using NPL would allow me to conduct sentiment analysis or keyword optimization on reviews or listing descriptions to further improve my model performance. 
+
+As mentioned in the data source section, my methodologies can be expanded to other cities. A more expansive data set covering all US cities can provide a more general pricing model. 
+
+***
+
+## Appendix
+### Exploratory Data Analysis
+### Essential Findings
+
+#### Response Variable
+
+The primary response variable I will be using will be `price`. Below is a distribution of Airbnb listing prices:
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE, fig.align='center'}
+# Price Distribution
+airbnb_data %>%
+  filter(price < 2500) %>%
+  ggplot(aes(x = price)) +
+    geom_histogram(binwidth = 20) +
+    labs(x = "Price ($)",
+         y = "Count",
+         title = "Airbnb Listing Price Distribution") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+As seen from the plot above, the distribution of listing prices is heavily skewed right. Most prices fall between $75 - $200 with the cheapest being $10 per night and the most expensive at $25,000 per night! The outliers will have to be removed to due to its potential to heavily influence the models (i.e. linear regression). Given the skewness of the data, I will have to log transform to normalize price data. 
+
+<br>
+
+#### Predictor Variables
+
+Overall, there are 72 different predictor variables. These variables range from the number people a listing can accommodate to fees to review ratings to amenities. With this said, the machine learning models we have learned in class should help with variable importance and selection. 
+
+Below, I have an intial investigation into some predictor variables that I believe to be important. 
+
+<br>
+
+#### Geolocation Predictor Variables
+
+To explore the effects of geolocation on listing prices, I made price heat maps for cities (Chicago and Seattle) using longitude and latitude pairs for each Airbnb listing observation.
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE, fig.width = 9, fig.align='center'}
+register_google(key = "INSERT API KEY", write = TRUE)
+
+# Chicago
+map <- get_map(location = "chicago, illinois", zoom = 12)
+
+data <- setDT(read.csv("data/unprocessed/chicago_map_data.csv", stringsAsFactors = FALSE))
+
+# generate bins for the x, y coordinates
+xbreaks <- seq(floor(min(data$latitude)), ceiling(max(data$latitude)), by = 0.01)
+ybreaks <- seq(floor(min(data$longitude)), ceiling(max(data$longitude)), by = 0.01)
+
+# allocate the data points into the bins
+data$latbin <- xbreaks[cut(data$latitude, breaks = xbreaks, labels=F)]
+data$longbin <- ybreaks[cut(data$longitude, breaks = ybreaks, labels=F)]
+
+# Summarise the data for each bin
+datamat <- data[, list(price = mean(price)), 
+                 by = c("latbin", "longbin")]
+
+# Merge the summarised data with all possible x, y coordinate combinations to get 
+# a value for every bin
+datamat <- merge(setDT(expand.grid(latbin = xbreaks, longbin = ybreaks)), datamat, 
+                 by = c("latbin", "longbin"), all.x = TRUE, all.y = FALSE)
+
+# Plot the contours
+chicago_map <- ggmap(map, extent = "device") +
+  stat_contour(data = datamat, aes(x = longbin, y = latbin, z = price, 
+               fill = ..level.., alpha = ..level..), geom = 'polygon', binwidth = 60) +
+  scale_fill_gradient(name = "Price", low = "green", high = "red") +
+  guides(alpha = FALSE) +
+  labs(caption = "Price Heat Map of Chicago, Illinois") +
+  theme(plot.caption = element_text(hjust = 0.5))
+
+# Seattle
+map <- get_map(location = "settle, washington", zoom = 11)
+
+data <- setDT(read.csv("data/unprocessed/seattle_map_data.csv", stringsAsFactors = FALSE))
+
+# generate bins for the x, y coordinates
+xbreaks <- seq(floor(min(data$latitude)), ceiling(max(data$latitude)), by = 0.01)
+ybreaks <- seq(floor(min(data$longitude)), ceiling(max(data$longitude)), by = 0.01)
+
+# allocate the data points into the bins
+data$latbin <- xbreaks[cut(data$latitude, breaks = xbreaks, labels=F)]
+data$longbin <- ybreaks[cut(data$longitude, breaks = ybreaks, labels=F)]
+
+# Summarise the data for each bin
+datamat <- data[, list(price = mean(price)), 
+                 by = c("latbin", "longbin")]
+
+# Merge the summarised data with all possible x, y coordinate combinations to get 
+# a value for every bin
+datamat <- merge(setDT(expand.grid(latbin = xbreaks, longbin = ybreaks)), datamat, 
+                 by = c("latbin", "longbin"), all.x = TRUE, all.y = FALSE)
+
+# Plot the contours
+seattle_map <- ggmap(map, extent = "device") +
+  stat_contour(data = datamat, aes(x = longbin, y = latbin, z = price, 
+               fill = ..level.., alpha = ..level..), geom = 'polygon', binwidth = 20) +
+  scale_fill_gradient(name = "Price", low = "green", high = "red") +
+  guides(alpha = FALSE) +
+  labs(caption = "Price Heat Map of Seattle, Washington") +
+  theme(plot.caption = element_text(hjust = 0.5))
+
+ggarrange(chicago_map, seattle_map, ncol = 2, common.legend = TRUE, legend = "bottom")
+```
+
+Looking that heat maps, we can see that there is an effect of neighborhood on listing price. The heat maps indicate listings closer to city and sea-shores tend to have higher prices. 
+
+<br> 
+
+#### Histograms
+
+Here, we can see histograms of some predictor variables I have initially believe to be important. These variables are `accommodates`, `cleaning_fee`, `security_deposit`, and `extra_people`. 
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE, fig.align='center'}
+accom_plot <- airbnb_data %>%
+  ggplot(aes(x = accommodates)) +
+    geom_histogram(binwidth = 1) +
+    labs(x = "Number of People",
+         y = "Count",
+         title = "Distribution of Accommodations") +
+    theme_minimal()
+
+cleaning_plot <- airbnb_data %>%
+  ggplot(aes(x = cleaning_fee)) +
+    geom_histogram(binwidth = 20) +
+    labs(x = "Cost ($)",
+         y = "Count",
+         title = "Distribution of Cleaning Fees") +
+    theme_minimal()
+
+sd_plot <- airbnb_data %>%
+  filter(security_deposit <= 10000) %>%
+  ggplot(aes(x = security_deposit)) +
+    geom_histogram(binwidth = 100) +
+    labs(x = "Cost ($)",
+         y = "Count",
+         title = "Distribution of Security Deposits") +
+    theme_minimal()
+
+ep_plot <- airbnb_data %>%
+  ggplot(aes(x = extra_people)) +
+    geom_histogram(binwidth = 5) +
+    labs(x = "Cost ($)",
+         y = "Count",
+         title = "Distribution of Extra People Cost") +
+    theme_minimal()
+
+plot_grid(accom_plot, cleaning_plot, sd_plot, ep_plot, ncol = 2)
+```
+
+Similar to prices, I will have to normalize these predictor variables values by log transforming them. Again, there are very large outliers for each of these variable (I filtered them out for the sake of the plot), so I will have to remove these outliers when modeling. 
+
+<br>
+
+#### Correlation Matrix
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE, out.width= "60%", out.extra='style="float:right; padding:1px"'}
+airbnb_data %>%
+  select(price, accommodates, bedrooms, beds, bathrooms, security_deposit, cleaning_fee, guests_included, extra_people, number_of_reviews) %>%
+  cor() %>% 
+  corrplot()
+```
+
+Looking at the corrplot of some sample predictors to our response variables below, we can see that there is some multicollinearity with our date, especially with my predictor variables of `accommodates`, `bedrooms`, `beds`, and `bathroom`. This make intuitive sense because the amount of people a property can accommodate is usually limited by the amount of beds.
+
+Moreover, we can see that the number of `bedrooms`, `beds`, and `bathrooms` show positive correlation with `cleaning_fee`. This intuatively makes sense, because as the number of these rooms increase, the more time / effort it takes to clean them after a booking!
+
+Based on my past experience with Airbnb and intuition, it seems like the number of people the listing can accommodate and the property fees effects the price (i.e. the more people, the more expensive and vice versa.). However, looking at the corrplot, we can see that these variables I have selected only show very weak correlation with price. 
+
+***
+
+### Secondary Findings
+
+#### Price by Property Type
+
+Finally, I briefly looked to see if there was any differences between listing prices and property type, house or apartment. Below I have two boxplots, the left is a raw unfiltered plot, while the right is filtered for prices under $400 per night.
+
+```{r, echo=FALSE, fig.width = 10, message = FALSE, warning = FALSE, fig.align='center'}
+uf_plot <- airbnb_data %>%
+  ggplot(aes(x = property_type, y = price)) +
+    geom_boxplot() +
+    labs(y = "Price ($)",
+         title = "Boxplot of Price by Property Type (Unfiltered)") +
+    theme_minimal()
+
+f_plot <- airbnb_data %>%
+  filter(price < 400) %>%
+  ggplot(aes(x = property_type, y = price, fill = property_type)) +
+    geom_boxplot() +
+    labs(y = "Price ($)",
+         title = "Boxplot of Price by Property Type (Filtered)") +
+    theme_minimal()
+
+plot_grid(uf_plot, f_plot, ncol = 2)
+```
+
+Looking at the unfiltered plot, we can see that the spread of house prices is drastically wider compared to apartments. However, looking at the filtered plot on the right, we can see that apartments actually have the higher average price. Given that the total observations between property types is pretty much the same, apartments may have higher prices because these properties are more likely to be located in a city center. With this said, the difference mean between property types is statistically insignificant. Thus, property types probably won't be that useful in predicting prices. 
+
+***
+
+### Codebook - Feature Identification
+
+* `price`- price of listing
+* `accommodates` - total number of people property can accommodate for
+* `security_deposit` - amount required for security deposit
+* `cleaning_fee` - amount required for cleaning fee
+* `extra_people` - the price per additional guest
+* `minimum_nights` - minimum length of stay
+* `maximum_nights` - maximum length of stay
+* `number_of_reviews` - total number of reviews on listing
+* `review_scores_rating_under80` - review score rating under 80
+* `review_scores_rating_80_94` - review score rating between 80 and 90
+* `review_scores_rating_95_100` - review score rating between 95 and 100
+* `review_scores_rating_unknown` - review score unknown
+* `property_type_house` - property type dummy (e.g. house or apartment)
+* `room_type_private_room` - room type dummy (e.g. whole house or private room)
+* `host_is_superhost_true` - host superhost identification
+* `instant_bookable_true` - whether or not the property can be instant booked
+* `cancellation_policy_flexible` - flexible cancellation policy
+* `cancellation_policy_moderate` - moderate cancellation policy
+* `cancellation_policy_strict` - strict cancellation policy
+* `walkscore` - international measure of walkability from listing to surrounding locations
+
+Amenities Dummy Variables: 1 if listing has, 0 if listing does not have
+
+* `tv`
+* `air_conditioning`
+* `balcony_patio `
+* `bed_linen `
+* `outdoor_space`
+* `breakfast`    
+* `coffee_machine`
+* `cooking_equip`
+* `white_goods`
+* `child_friendly`
+* `parking`
+* `greet_by_host`
+* `internet`
+* `long_term_stay`
+* `pets` 
+* `private_entrance` 
+* `security_system`
+* `self_checkin`
+* `gym` 
+
+
+
+
+
+
+
+
+
+
+
+
+
